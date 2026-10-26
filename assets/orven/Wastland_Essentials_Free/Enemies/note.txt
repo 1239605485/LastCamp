@@ -1,0 +1,18 @@
+The spritesheet is organized row by row based on the enemy's animation states and directions:
+
+Idle Animations:
+Row 1: Idle-Left
+Row 2: Idle-Right
+Row 3: Idle-Up
+Row 4: Idle-Down
+
+Walking Animations:
+Row 5: Walk-Left
+Row 6: Walk-Right
+Row 7: Walk-Up
+Row 8: Walk-Down
+
+etc.
+
+Each row contains evenly spaced frames corresponding to the animation for that specific state and direction. 
+This structured layout makes it easy to extract frames programmatically for smooth animation implementation.

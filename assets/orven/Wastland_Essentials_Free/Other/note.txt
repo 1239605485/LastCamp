@@ -1,0 +1,5 @@
+A separate shadow sprite is included for character animations. This shadow should be placed beneath the character sprite to create a realistic grounding effect.
+
+You can customize the shadow's appearance by adjusting its alpha (transparency) level to suit the visual style of your game. 
+This flexibility allows for better integration with different environments and lighting conditions.
+

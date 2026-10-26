@@ -1,0 +1,29 @@
+Note on Player Spritesheet and Hand Animations
+
+1. The PlayerBase spritesheet does not include hand sprites.
+Instead, the hands are provided in a separate file. 
+This approach allows for weapon animations to be integrated seamlessly with the player's hands.
+If the hands were included directly in the player spritesheet, the player would appear to have four hands while holding a weapon 
+(two from the player spritesheet and two from the weapon animation).
+
+This setup ensures smooth, customizable weapon animations while maintaining visual consistency.
+
+
+2. The spritesheet is organized row by row based on the player's animation states and directions:
+
+Idle Animations:
+Row 1: Idle-Left
+Row 2: Idle-Right
+Row 3: Idle-Up
+Row 4: Idle-Down
+
+Walking Animations:
+Row 5: Walk-Left
+Row 6: Walk-Right
+Row 7: Walk-Up
+Row 8: Walk-Down
+
+etc.
+
+Each row contains evenly spaced frames corresponding to the animation for that specific state and direction. 
+This structured layout makes it easy to extract frames programmatically for smooth animation implementation.
