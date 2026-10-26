@@ -1,0 +1,54 @@
+{
+  "kind": "lexical-and-reference-check-only",
+  "gdscript_files": 22,
+  "literal_resource_references": 52,
+  "errors": [],
+  "changes": [
+    {
+      "file": "scripts/art.gd",
+      "added": 2,
+      "removed": 1
+    },
+    {
+      "file": "scripts/world.gd",
+      "added": 10,
+      "removed": 5
+    },
+    {
+      "file": "scripts/weapon_recoil.gd",
+      "status": "added"
+    },
+    {
+      "file": "scripts/tactical_systems.gd",
+      "added": 11,
+      "removed": 2
+    },
+    {
+      "file": "scripts/rules.gd",
+      "added": 4,
+      "removed": 0
+    },
+    {
+      "file": "scripts/world_view.gd",
+      "added": 5,
+      "removed": 1
+    },
+    {
+      "file": "scripts/survival_systems.gd",
+      "added": 3,
+      "removed": 2
+    },
+    {
+      "file": "scripts/game.gd",
+      "added": 12,
+      "removed": 2
+    },
+    {
+      "file": "scripts/resource_cycle.gd",
+      "status": "added"
+    }
+  ],
+  "godot_runtime": "NOT EXECUTED: executable unavailable",
+  "android_export": "NOT EXECUTED: SDK/templates unavailable",
+  "new_test_files_lexical_checked": 4
+}

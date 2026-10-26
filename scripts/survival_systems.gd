@@ -1,6 +1,7 @@
 extends RefCounted
 
 const R = preload("res://scripts/rules.gd")
+const G = preload("res://scripts/building_geometry.gd")
 const FRESH_MINUTES = {"berry":1440.0,"apple":4320.0,"tomato":2880.0,"squash":5760.0}
 const WEATHER_NAMES = {"clear":"晴","cloudy":"多云","rain":"雨","heavy_rain":"暴雨"}
 const RECIPES = [
@@ -49,7 +50,14 @@ static func _refresh_trader(w):
 	var s: Dictionary = w.state.systems_v5
 	var day = int(float(w.state.minute) / 1440)
 	if int(s.trader_day) != day:
-		s.trader_day = day; s.trader_stock = {"ammo":3,"battery":2,"fuel":2}
+		s.trader_day = day; s.trader_stock = {}
+
+static func trader_key(w,recipe: String) -> String:
+	var trader=facility_near(w,"shop")
+	if trader.is_empty(): return ""
+	var key=str(w.state.get("map_id","town"))+":"+str(trader.container)+":"+recipe
+	if not w.state.systems_v5.trader_stock.has(key): w.state.systems_v5.trader_stock[key]=3 if recipe=="ammo" else 2
+	return key
 
 static func advance(w,minutes: float):
 	ensure(w)
@@ -62,11 +70,11 @@ static func advance(w,minutes: float):
 		if s.battery <= 0: s.flashlight_on = false; w.note("手电电量耗尽。")
 	if s.generator_on:
 		s.fuel_minutes = maxf(0,float(s.fuel_minutes) - minutes)
-		if s.fuel_minutes <= 0: s.generator_on = false; w.note("营地发电机燃油耗尽。")
+		if s.fuel_minutes <= 0: s.generator_on = false; w.note("发电机燃油耗尽。")
 	var block = int(float(w.state.minute) / 360)
 	if int(s.weather_block) != block:
 		s.weather_block = block
-		var index = posmod(block * 17 + int(w.map.seed),10)
+		var index = posmod(block * 17 + int(w.state.world_seed),10)
 		var weather: String = "clear" if index < 4 else ("cloudy" if index < 6 else ("rain" if index < 9 else "heavy_rain"))
 		if s.weather != weather: s.weather = weather; w.note("天气转为" + WEATHER_NAMES[weather] + "。")
 	_events(w)
@@ -80,12 +88,28 @@ static func visibility_factor(w) -> float:
 
 static func light_factor(w) -> float:
 	var s: Dictionary = w.state.get("systems_v5",{})
-	return 1.0 if not _night(w) else (0.9 if s.get("flashlight_on",false) and s.get("battery",0) > 0 else (0.8 if w.state.zone == "camp" and s.get("generator_on",false) else 0.45))
+	return 1.0 if not _night(w) else (0.9 if s.get("flashlight_on",false) and s.get("battery",0) > 0 else 0.45)
 
 static func summary(w) -> String:
 	ensure(w)
 	var s: Dictionary = w.state.systems_v5
-	return "%s | 疲劳%d%s | 手电%d%% %s | 发电机%d分%s" % [WEATHER_NAMES.get(s.weather,"晴"),roundi(s.fatigue),"(休息)" if s.resting else "",roundi(s.battery),"开" if s.flashlight_on else "关",ceili(s.fuel_minutes),"运行" if s.generator_on else "停机"]
+	return "%s | 疲劳%d%s | 手电%d%% %s" % [WEATHER_NAMES.get(s.weather,"晴"),roundi(s.fatigue),"(床位睡眠×4)" if s.sleeping else ("(休息)" if s.resting else ""),roundi(s.battery),"开" if s.flashlight_on else "关"]
+
+static func available_bed(w) -> Dictionary:
+	if not w.has_method("near_bed"): return {}
+	var bed: Dictionary = w.near_bed()
+	if bed.is_empty(): return {}
+	var p=Vector2(w.state.px,w.state.py)
+	for b in w.map.buildings:
+		if b.container==bed.get("building_id","") and G.interior(b).has_point(p): return bed
+	return {}
+
+static func facility_near(w,kind: String) -> Dictionary:
+	var p=Vector2(w.state.px,w.state.py)
+	for b in w.map.buildings_at(p,220):
+		if b.get("kind","")!=kind: continue
+		if G.interior(b).has_point(p) and p.distance_to(G.loot_point(b))<=90: return b
+	return {}
 
 static func _near(w,zone: String,p: Vector2,radius: float = 90.0) -> bool:
 	return w.state.zone == zone and Vector2(w.state.px,w.state.py).distance_to(p) <= radius
@@ -95,25 +119,26 @@ static func actions(w) -> Array:
 	var s: Dictionary = w.state.systems_v5
 	var result: Array = []
 	result.append({"label":"结束休息" if s.resting else "原地休息（移动会结束）","request":{"kind":"sys_rest"},"duration":2.0})
-	if _near(w,"camp",Vector2(505,500),85): result.append({"label":"床位睡眠（移动或受击醒来）","request":{"kind":"sys_sleep"},"duration":3.0})
+	if not available_bed(w).is_empty(): result.append({"label":"床位睡眠×4（危险会唤醒）","request":{"kind":"sys_sleep"},"duration":3.0})
 	result.append({"label":"关闭手电" if s.flashlight_on else "开启手电","request":{"kind":"sys_light"},"duration":0.4})
 	if w.owned("player").any(func(item):return FRESH_MINUTES.has(item.def) and not can_eat(w,item)):
 		result.append({"label":"清理随身变质食物","request":{"kind":"sys_discard_food"},"duration":1.2})
 	if w.count_item("battery") > 0: result.append({"label":"更换手电电池" if s.battery<100 else "手电电量已满","request":{"kind":"sys_battery"},"duration":2.0,"enabled":s.battery<100})
-	if _near(w,"camp",Vector2(430,440),150):
+	if not facility_near(w,"workshop").is_empty():
 		result.append({"label":"关闭发电机" if s.generator_on else ("开启发电机" if s.fuel_minutes>0 else "开启发电机 · 需先添加燃油"),"request":{"kind":"sys_generator"},"duration":1.2,"enabled":s.generator_on or s.fuel_minutes>0})
-		result.append({"label":"添加燃油（120分钟）" if w.count_item("fuel")>0 else "添加燃油 · 请从仓库取出燃油","request":{"kind":"sys_fuel"},"duration":2.0,"enabled":w.count_item("fuel")>0})
-	if _near(w,"camp",Vector2(740,420)):
+		result.append({"label":"添加燃油（120分钟）" if w.count_item("fuel")>0 else "添加燃油 · 需要探索取得燃油","request":{"kind":"sys_fuel"},"duration":2.0,"enabled":w.count_item("fuel")>0})
+	if not facility_near(w,"shop").is_empty():
 		for recipe in RECIPES:
-			if int(s.trader_stock.get(recipe.id,0)) > 0: result.append({"label":"商人：" + recipe.label,"request":{"kind":"sys_trade","recipe":recipe.id},"duration":2.0})
+			if int(s.trader_stock.get(trader_key(w,recipe.id),0)) > 0: result.append({"label":"商人：" + recipe.label,"request":{"kind":"sys_trade","recipe":recipe.id},"duration":2.0})
 	for event in s.events:
-		if event.status == "active" and _near(w,event.zone,Vector2(event.x,event.y)):
+		if event.get("map_id","town")==w.state.get("map_id","town") and event.status == "active" and _near(w,event.zone,Vector2(event.x,event.y)):
 			result.append({"label":"领取空投" if event.type == "supply" else "救助幸存者（交付1饮用水）","request":{"kind":"sys_event","id":event.id},"duration":4.0})
-	return result
+	return result + w.resource_actions()
 
 static func complete(w,request: Dictionary) -> bool:
 	ensure(w)
 	if w.state.get("failed",false): return false
+	if str(request.get("kind","")).begins_with("sys_cycle_"): return w.Cycle.complete(w,request)
 	var s: Dictionary = w.state.systems_v5
 	match request.get("kind",""):
 		"sys_discard_food":
@@ -124,7 +149,7 @@ static func complete(w,request: Dictionary) -> bool:
 			return discarded
 		"sys_rest": s.resting = not s.resting; s.sleeping=false; return true
 		"sys_sleep":
-			if not _near(w,"camp",Vector2(505,500),85): return false
+			if available_bed(w).is_empty(): return false
 			if w.enemies.any(func(e):return e.zone==w.state.zone and e.hp>0 and Vector2(e.x,e.y).distance_to(Vector2(w.state.px,w.state.py))<140): return false
 			s.resting=true; s.sleeping=true; return true
 		"sys_light":
@@ -134,25 +159,27 @@ static func complete(w,request: Dictionary) -> bool:
 			if s.battery >= 100 or not w.consume("battery",1): return false
 			s.battery = 100.0; return true
 		"sys_generator":
-			if not _near(w,"camp",Vector2(430,440),150) or (not s.generator_on and s.fuel_minutes <= 0): return false
+			if facility_near(w,"workshop").is_empty() or (not s.generator_on and s.fuel_minutes <= 0): return false
 			s.generator_on = not s.generator_on; return true
 		"sys_fuel":
-			if not _near(w,"camp",Vector2(430,440),150) or s.fuel_minutes > 480 or not w.consume("fuel",1): return false
+			if facility_near(w,"workshop").is_empty() or s.fuel_minutes > 480 or not w.consume("fuel",1): return false
 			s.fuel_minutes += 120.0; return true
 		"sys_trade":
-			if not _near(w,"camp",Vector2(740,420)): return false
+			if facility_near(w,"shop").is_empty(): return false
 			for recipe in RECIPES:
-				if recipe.id != request.get("recipe","") or int(s.trader_stock.get(recipe.id,0)) <= 0: continue
+				var key=trader_key(w,recipe.id)
+				if recipe.id != request.get("recipe","") or int(s.trader_stock.get(key,0)) <= 0: continue
 				if not _exchange(w,recipe.cost,recipe.reward): return false
-				s.trader_stock[recipe.id] -= 1; w.note("与中立商人完成交易：" + recipe.label); return true
+				s.trader_stock[key] -= 1; w.note("与中立商人完成交易：" + recipe.label); return true
 		"sys_event":
 			for event in s.events:
-				if event.id != request.get("id","") or event.status != "active" or float(w.state.minute) >= float(event.expires) or not _near(w,event.zone,Vector2(event.x,event.y)): continue
+				if event.get("map_id","town")!=w.state.get("map_id","town") or event.id != request.get("id","") or event.status != "active" or float(w.state.minute) >= float(event.expires) or not _near(w,event.zone,Vector2(event.x,event.y)): continue
 				var cost: Dictionary = {"water":1} if event.type == "rescue" else {}
 				for key in cost:
 					if w.count_item(key) < cost[key]: return false
 				var released = 0.6 if event.type == "rescue" else 0.0
 				if w.weight("player") - released + w.weight(event.id) > w.capacity: return false
+				if w.has_method("has_slot_room") and not w.has_slot_room(slot_delta(w,cost,w.owned(event.id).size())): return false
 				for key in cost: w.consume(key,cost[key])
 				for item in w.owned(event.id): item.owner = "player"
 				event.status = "claimed"
@@ -172,9 +199,20 @@ static func _exchange(w,cost: Dictionary,reward: Dictionary) -> bool:
 		if not R.ITEMS.has(key): return false
 		delta += R.ITEMS[key].weight * reward[key]
 	if w.weight("player") + delta > w.capacity: return false
+	if w.has_method("has_slot_room") and not w.has_slot_room(slot_delta(w,cost,reward.size())): return false
 	for key in cost: w.consume(key,cost[key])
 	for key in reward: w.add_item(key,reward[key],"player")
 	return true
+
+static func slot_delta(w,cost: Dictionary,incoming: int) -> int:
+	var freed=0
+	for definition in cost:
+		var remaining: int=cost[definition]
+		for item in w.owned("player"):
+			if item.def!=definition or remaining<=0: continue
+			if item.qty<=remaining: freed+=1
+			remaining-=mini(remaining,item.qty)
+	return incoming-freed
 
 static func _events(w):
 	var s: Dictionary = w.state.systems_v5
@@ -198,14 +236,14 @@ static func _events(w):
 	if float(w.state.minute) >= start + 1440: return
 	var point = _event_point(w,index)
 	var id = "event_v5_%d" % index
-	var event = {"id":id,"type":"supply" if index % 2 == 0 else "rescue","zone":"town","x":point.x,"y":point.y,"status":"active","expires":start + 1440}
+	var event = {"id":id,"map_id":w.state.get("map_id","town"),"type":"supply" if index % 2 == 0 else "rescue","zone":"town","x":point.x,"y":point.y,"status":"active","expires":start + 1440}
 	s.events.append(event)
 	while s.events.size() > 4: s.events.pop_front()
 	for entry in [["food",2],["ammo9",12]] if event.type == "supply" else [["bandage",2],["parts",2]]: w.add_item(entry[0],entry[1],id)
-	w.note("营地无线电：%s，公路坐标(%d,%d)，请在24小时内前往。" % ["补给空投已落地" if event.type == "supply" else "幸存者求助，需要1饮用水",point.x,point.y])
+	w.note("无线电：%s，当前地区公路坐标(%d,%d)，请在24小时内前往。" % ["补给空投已落地" if event.type == "supply" else "幸存者求助，需要1饮用水",point.x,point.y])
 
 static func _event_point(w,index: int) -> Vector2:
-	if w.map.roads.is_empty(): return Vector2(610,490)
+	if w.map.roads.is_empty(): return Vector2(610,450)
 	var road: Dictionary = w.map.roads[posmod(index,w.map.roads.size())]
 	return (road.a + road.b) / 2.0
 
@@ -213,7 +251,7 @@ static func event_markers(w) -> Array:
 	ensure(w)
 	var result: Array = []
 	for event in w.state.systems_v5.events:
-		if event.status == "active": result.append(event)
+		if event.status == "active" and event.get("map_id","town")==w.state.get("map_id","town"): result.append(event)
 	return result
 
 static func valid_owners(w) -> Array:

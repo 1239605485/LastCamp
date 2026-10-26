@@ -6,6 +6,10 @@ const BAG_WEIGHT = 28.0
 const ACTION_SECONDS = 1.2
 const Catalog = preload("res://scripts/catalog.gd")
 const BASE_ITEMS = {
+	"dirty_water": {"name":"脏水（不可直饮）", "weight":0.6, "color":"819c74"},
+	"purification_tablet": {"name":"净水片", "weight":0.02, "color":"dce5d6"},
+	"rain_collector": {"name":"集雨桶套件", "weight":2.0, "color":"709fa4"},
+	"cloth": {"name":"干净布料", "weight":0.1, "color":"c4c3af"},
 	"food": {"name":"罐头", "weight":0.5, "color":"d6a154"},
 	"berry": {"name":"野莓", "weight":0.12, "color":"716a9d", "nutrition":12, "water_gain":6},
 	"apple": {"name":"苹果", "weight":0.2, "color":"b7b352", "nutrition":18, "water_gain":8},

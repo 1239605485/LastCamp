@@ -10,6 +10,7 @@ const Pose = preload("res://scripts/actor_pose.gd")
 const Forage = preload("res://scripts/forage.gd")
 const Survival = preload("res://scripts/survival_systems.gd")
 const Tactics = preload("res://scripts/tactical_systems.gd")
+const Recoil = preload("res://scripts/weapon_recoil.gd")
 const Navigation = preload("res://scripts/local_navigation.gd")
 var world = World.new()
 var view
@@ -18,25 +19,34 @@ var camera: Camera2D
 var aim = Vector2.RIGHT
 var moving = false
 var action: Dictionary = {}
+var recoil_heat: Dictionary = {}
 var shot_cd = 0.0
 var guard_cd = 0.0
 var autosave = 0.0
 var transition_cd = 0.0
 var last_damage = 0.0
 var sound
-var last_wave_day = 0
 var placement: Dictionary = {}
 var solid_cache: Array = []
 var solid_cache_key = 0
 var polygon_cache: Array = []
+var solid_rect_grid: Dictionary = {}
+var solid_polygon_grid: Dictionary = {}
+var last_collision_candidates = 0
+var last_visibility_candidates = 0
+const SOLID_GRID_CELL = 128.0
 var focus = 0.0
 var combat_state = "idle"
 var random = RandomNumberGenerator.new()
-var world_zoom = 1.0
+var world_zoom = 1.25
+var footstep_noise = 0.0
 var walk_direction = Vector2.DOWN
+var visual_refresh_clock = 0.0
+var hud_refresh_clock = 0.0
+var enemy_update_cursor = 0
 
 func set_world_zoom(value: float):
-	world_zoom = clampf(value,0.65,1.8)
+	world_zoom = clampf(value,0.65,2.0)
 	if camera != null: camera.zoom = Vector2.ONE * world_zoom
 
 func muzzle_position() -> Vector2:
@@ -52,7 +62,6 @@ func _ready():
 	random.randomize()
 	hud = Hud.new(); hud.game = self; add_child(hud)
 	ensure_spawn_point()
-	if world.state.failed: hud.open_panel("failure")
 	get_tree().auto_accept_quit = false
 
 func player_pos() -> Vector2:
@@ -70,13 +79,21 @@ func _notification(what):
 
 func _process(delta: float):
 	if hud == null: return
-	hud.refresh()
+	hud_refresh_clock += delta
+	if hud_refresh_clock >= 0.1:
+		hud.refresh()
+		hud_refresh_clock = fposmod(hud_refresh_clock,0.1)
 	camera.position = player_pos() + Vector2(0,-40)
-	view.queue_redraw()
-	if world.paused or world.state.failed: return
+	visual_refresh_clock += delta
+	if visual_refresh_clock >= 1.0/30.0:
+		view.queue_redraw()
+		visual_refresh_clock = fposmod(visual_refresh_clock,1.0/30.0)
+	if world.paused: return
+	delta = minf(delta,0.1)
+	cool_recoil(delta)
+	wake_for_threat()
+	if world.state.systems_v5.sleeping: delta *= 4.0
 	world.tick(delta)
-	if world.state.wave_day > last_wave_day:
-		last_wave_day = world.state.wave_day; sound.play("alarm")
 	shot_cd = maxf(0, shot_cd - delta); guard_cd -= delta; autosave += delta; transition_cd -= delta; last_damage -= delta
 	for f in view.flashes: f.life -= delta
 	view.flashes = view.flashes.filter(func(f): return f.life > 0)
@@ -95,6 +112,9 @@ func _process(delta: float):
 		var speed = R.SPEED * (0.72 if world.state.stamina < 10 else 1.0) * (0.8 if world.state.systems_v5.fatigue>=80 else 1.0)
 		set_pos(move_with_collision(player_pos(), movement * speed * delta))
 		world.state.stamina = maxf(0, world.state.stamina - delta * 1.8)
+		footstep_noise -= delta
+		if footstep_noise<=0:
+			emit_noise(player_pos(),80,false); footstep_noise=0.8
 	else: world.state.stamina = minf(100, world.state.stamina + delta * (4 if world.state.systems_v5.fatigue>=80 else 8))
 	if hud.aim_axis.length() > 0.2: aim = hud.aim_axis.normalized()
 	elif not DisplayServer.is_touchscreen_available():
@@ -105,7 +125,7 @@ func _process(delta: float):
 	if not moving:
 		combat_state = "aim" if aiming else "idle"
 		focus = minf(1,focus + delta * current_stats().get("focus",1.0) * 0.8) if aiming else maxf(0,focus - delta * 0.3)
-	if hud.fire_held or mouse_shoot or Input.is_physical_key_pressed(KEY_SPACE): fire()
+	if hud.fire_held or hud.aim_axis.length()>0.2 or mouse_shoot or Input.is_physical_key_pressed(KEY_SPACE): fire()
 	if world.state.zone == "town":
 		var sector = world.map.sector_id(player_pos())
 		if sector not in world.state.explored:
@@ -116,25 +136,40 @@ func _process(delta: float):
 	update_enemies(delta)
 	if Tactics.tick(self,delta): sound.play("alarm")
 	update_npcs(delta)
-	world.finish_wave()
-	if world.state.has("battle_report") and not world.state.get("report_seen",true):
-		world.state.report_seen = true; world.save_game(); hud.open_panel("battle")
 	if world.state.hp <= 0:
-		action.clear(); world.die(); world.save_game()
-	if world.state.core <= 0 or world.state.failed:
-		world.state.failed = true; action.clear(); world.save_game(); hud.open_panel("failure")
-	if transition_cd <= 0:
-		if world.state.zone == "camp" and player_pos().x > 1210: change_zone("town", Vector2(95, 490))
-		elif world.state.zone == "town" and player_pos().x < 65 and absf(player_pos().y - 490) < 100: change_zone("camp", Vector2(1160, 490))
+		action.clear(); placement.clear(); world.die(); solid_cache_key=-1; ensure_spawn_point(); world.save_game()
 	if autosave > 20:
 		world.save_game(); autosave = 0
 
-func change_zone(zone: String, pos: Vector2):
-	action.clear(); world.state.zone = zone; set_pos(pos); transition_cd = 2
-	for n in world.npcs:
-		if n.follow and n.status != "down": n.zone = zone; n.x = pos.x + 25; n.y = pos.y + 20
-	world.save_game()
-	world.note("进入榆树镇。建筑前后门可进入；物资不会因离开刷新。" if zone == "town" else "返回营地。北墙与守卫已按统一时间结算。")
+func change_zone(zone: String, _pos: Vector2):
+	# Compatibility entry point; regions now travel only through an explicit exit.
+	travel_request("forest" if zone=="forest" else "town")
+
+func travel_request(target_map_id: String) -> bool:
+	if world.paused or not action.is_empty(): return false
+	if not world.travel(target_map_id): return false
+	solid_cache_key=-1; solid_cache.clear(); polygon_cache.clear(); placement.clear()
+	Navigation.cache.clear(); transition_cd=2
+	return true
+
+func emit_noise(source: Vector2, radius: float, announce: bool = true):
+	for enemy in world.enemies:
+		if enemy.hp<=0 or enemy.zone!=world.state.zone: continue
+		var ep=Vector2(enemy.x,enemy.y)
+		var effective=radius if visible(source,ep) else radius*0.55
+		if ep.distance_to(source)>effective: continue
+		enemy.alert=maxf(enemy.get("alert",0),8)
+		enemy["mode"]="investigate"; enemy.tx=source.x; enemy.ty=source.y
+	if announce and radius>=300: world.note("响声传向附近街区，感染者会调查声源。")
+
+func wake_for_threat() -> bool:
+	if not world.state.get("systems_v5",{}).get("sleeping",false): return false
+	for enemy in world.enemies:
+		if enemy.hp>0 and enemy.zone==world.state.zone and Vector2(enemy.x,enemy.y).distance_to(player_pos())<140:
+			world.state.systems_v5.sleeping=false; world.state.systems_v5.resting=false
+			world.note("附近的动静惊醒了你。")
+			return true
+	return false
 
 func building_walls(b: Dictionary) -> Array:
 	return Geometry.rectangles(b)
@@ -144,7 +179,7 @@ func door_rect(b: Dictionary, side: int) -> Rect2:
 
 func solids() -> Array:
 	var chunk = Vector2i(player_pos() / 600)
-	var key = hash([world.map.seed,world.state.zone,world.doors,world.furniture,world.state.wall > 0,chunk,world.defenses,world.state.get("tactics_v5",{})])
+	var key = hash([world.map.seed,world.state.get("map_id","town"),world.doors,world.furniture,chunk,world.defenses,world.state.get("tactics_v5",{})])
 	if key == solid_cache_key and not solid_cache.is_empty(): return solid_cache
 	var result: Array = []
 	polygon_cache.clear()
@@ -157,9 +192,6 @@ func solids() -> Array:
 				polygon_cache.append({"points":polygon,"bounds":box})
 			for side in [0]:
 				if Tactics.door_blocked(world,b): result.append(door_rect(b, side))
-	else:
-		result.append(Rect2(300, 290, 150, 88))
-		if world.state.wall > 0: result.append(Rect2(255, 250, 395, 21))
 	for f in world.furniture:
 		if not f.packed and f.hp > 0 and f.zone == world.state.zone: result.append(Rect2(f.x - 16, f.y - 16, 32, 28))
 	for car in world.map.cars_at(player_pos(),2100,world.state.zone): result.append(car.body)
@@ -167,19 +199,46 @@ func solids() -> Array:
 	for plant in world.map.plants_at(player_pos(),2100,world.state.zone):
 		if plant.kind == "apple": result.append(Rect2(plant.pos-Vector2(6,4),Vector2(12,8)))
 	result.append_array(Tactics.solids(self))
-	if world.state.zone == "camp":
-		for defense in world.defenses:
-			if defense.hp > 0 and defense.kind != "wire": result.append(defense_rect(defense))
+	for defense in world.defenses:
+		if defense.hp > 0 and defense.kind != "wire": result.append(defense_rect(defense))
 	solid_cache_key = key; solid_cache = result
+	solid_rect_grid.clear(); solid_polygon_grid.clear()
+	for index in range(solid_cache.size()): _index_spatial(solid_rect_grid,solid_cache[index],index)
+	for index in range(polygon_cache.size()): _index_spatial(solid_polygon_grid,polygon_cache[index].bounds,index)
+	return result
+
+func _index_spatial(grid: Dictionary,rect: Rect2,index: int):
+	var start=Vector2i(floori(rect.position.x/SOLID_GRID_CELL),floori(rect.position.y/SOLID_GRID_CELL))
+	var end=Vector2i(floori(rect.end.x/SOLID_GRID_CELL),floori(rect.end.y/SOLID_GRID_CELL))
+	for y in range(start.y,end.y+1):
+		for x in range(start.x,end.x+1):
+			var cell=Vector2i(x,y)
+			if not grid.has(cell): grid[cell]=[]
+			grid[cell].append(index)
+
+func _spatial_candidates(grid: Dictionary,bounds: Rect2,count: int) -> Array:
+	var start=Vector2i(floori(bounds.position.x/SOLID_GRID_CELL),floori(bounds.position.y/SOLID_GRID_CELL))
+	var end=Vector2i(floori(bounds.end.x/SOLID_GRID_CELL),floori(bounds.end.y/SOLID_GRID_CELL))
+	var seen={}; var result=[]
+	for y in range(start.y,end.y+1):
+		for x in range(start.x,end.x+1):
+			for index in grid.get(Vector2i(x,y),[]):
+				if index<count and not seen.has(index): seen[index]=true; result.append(index)
 	return result
 
 func blocked(pos: Vector2) -> bool:
-	var limit: Vector2 = world.map.size if world.state.zone == "town" else Vector2(1300,1090)
+	var limit: Vector2 = world.map.size
 	if pos.x < 40 or pos.x > limit.x - 40 or pos.y < 20 or pos.y > limit.y - 40: return true
 	if world.state.zone == "town" and world.map.water_at(pos): return true
-	for rect in solids():
+	solids()
+	var candidates=_spatial_candidates(solid_rect_grid,Rect2(pos-Vector2(6,6),Vector2(12,12)),solid_cache.size())
+	last_collision_candidates=candidates.size()
+	for index in candidates:
+		var rect: Rect2=solid_cache[index]
 		if rect.grow(4.5).has_point(pos): return true
-	for entry in polygon_cache:
+	var polygon_candidates=_spatial_candidates(solid_polygon_grid,Rect2(pos-Vector2(6,6),Vector2(12,12)),polygon_cache.size())
+	for index in polygon_candidates:
+		var entry: Dictionary=polygon_cache[index]
 		if not entry.bounds.grow(5).has_point(pos): continue
 		for offset in [Vector2.ZERO,Vector2(4,0),Vector2(-4,0),Vector2(0,4),Vector2(0,-4)]:
 			if Geometry2D.is_point_in_polygon(pos + offset,entry.points): return true
@@ -194,14 +253,21 @@ func move_with_collision(pos: Vector2, motion: Vector2) -> Vector2:
 		if not blocked(next): pos = next
 	return pos
 
-func visible(a: Vector2, b: Vector2, ignore_low_cover: bool = false) -> bool:
-	for rect in solids():
-		if ignore_low_cover and world.state.zone=="camp" and rect==Rect2(255,250,395,21): continue
+func visible(a: Vector2, b: Vector2, _ignore_low_cover: bool = false) -> bool:
+	solids()
+	var low=Vector2(minf(a.x,b.x),minf(a.y,b.y)); var high=Vector2(maxf(a.x,b.x),maxf(a.y,b.y))
+	var bounds=Rect2(low,high-low).grow(2)
+	var candidates=_spatial_candidates(solid_rect_grid,bounds,solid_cache.size())
+	last_visibility_candidates=candidates.size()
+	for index in candidates:
+		var rect: Rect2=solid_cache[index]
+		if not rect.grow(2).intersects(bounds): continue
 		if Geometry2D.segment_intersects_segment(a,b,rect.position,Vector2(rect.end.x,rect.position.y)) != null: return false
 		if Geometry2D.segment_intersects_segment(a,b,Vector2(rect.end.x,rect.position.y),rect.end) != null: return false
 		if Geometry2D.segment_intersects_segment(a,b,rect.end,Vector2(rect.position.x,rect.end.y)) != null: return false
 		if Geometry2D.segment_intersects_segment(a,b,Vector2(rect.position.x,rect.end.y),rect.position) != null: return false
-	for entry in polygon_cache:
+	for index in _spatial_candidates(solid_polygon_grid,bounds,polygon_cache.size()):
+		var entry: Dictionary=polygon_cache[index]
 		if Geometry2D.get_closest_point_to_segment(entry.bounds.get_center(),a,b).distance_to(entry.bounds.get_center()) > entry.bounds.size.length()/2 + 3: continue
 		var points: PackedVector2Array = entry.points
 		for i in range(points.size()):
@@ -214,6 +280,11 @@ func can_see_actor(pos: Vector2) -> bool:
 		for b in world.map.buildings_at(player_pos(),1300):
 			if Geometry.interior(b).has_point(pos) and not Geometry.interior(b).has_point(player_pos()): return false
 	return visible(player_pos(),pos)
+
+func cool_recoil(delta: float):
+	for id in recoil_heat.keys():
+		recoil_heat[id] = Recoil.cool(float(recoil_heat[id]),delta)
+		if recoil_heat[id]<=0 or not world.items.has(id): recoil_heat.erase(id)
 
 func fire():
 	if shot_cd > 0 or world.paused: return
@@ -244,10 +315,9 @@ func fire():
 			return
 		gun.ammo -= 1
 		var d = R.weapon_stats(gun,world.items); damage = d.damage; reach = d.range; shot_cd = d.cooldown; pellets = d.pellets
-		spread = d.spread * lerpf(2.6,0.4,focus) * (1.7 if moving else 1.0)
-		for enemy in world.enemies:
-			if enemy.zone == world.state.zone and Vector2(enemy.x,enemy.y).distance_to(player_pos()) < d.noise:
-				enemy.alert = 7; enemy.tx = world.state.px; enemy.ty = world.state.py
+		spread = d.spread * lerpf(2.6,0.4,focus) * (1.7 if moving else 1.0) + float(recoil_heat.get(id,0.0))
+		recoil_heat[id] = Recoil.after_shot(float(recoil_heat.get(id,0.0)),d.spread)
+		emit_noise(player_pos(),d.noise)
 	else:
 		shot_cd = 0.48; world.state.stamina -= 8
 	sound.play("melee" if melee else "shot")
@@ -281,77 +351,93 @@ func current_stats() -> Dictionary:
 
 func cycle_weapon(category: String):
 	var choices = world.owned("player").filter(func(i): return i.has("slots") and ((i.def in ["pistol","pm","colt","magnum"]) == (category == "sidearm")))
-	if choices.is_empty(): world.note("背包中没有这类枪械，请到军械箱或建筑搜刮。"); return
+	if choices.is_empty(): world.note("背包中没有这类枪械，请探索警务点或建筑搜刮。"); return
 	var identifiers = choices.map(func(i): return i.id)
 	var selected = world.player_weapon(world.state.weapon)
 	world.equip(identifiers[(identifiers.find(selected) + 1) % identifiers.size()])
 	focus = 0; action.clear()
 
 func update_enemies(delta: float):
+	var active: Array=[]
+	var player=player_pos()
 	for e in world.enemies:
 		if e.zone != world.state.zone or e.hp <= 0: continue
-		if e.zone == "town" and Vector2(e.x,e.y).distance_squared_to(player_pos()) > 1250 * 1250: continue
-		var p = Vector2(e.x, e.y); e.cd -= delta; e.alert = maxf(0, e.alert - delta)
-		var sight = (140.0 if is_night() else 240.0)*Survival.visibility_factor(world)
-		e["sense_left"] = e.get("sense_left",0.0) - delta
-		if e.sense_left <= 0:
-			e.sense_left = 0.3
-			if p.distance_to(player_pos()) < sight and visible(p, player_pos()): e.alert = 5; e.tx = world.state.px; e.ty = world.state.py
-		if e.alert <= 0 and not e.wave:
-			e["wander_left"] = e.get("wander_left",0.0) - delta
-			if e.wander_left <= 0 or p.distance_to(Vector2(e.tx,e.ty)) < 9:
-				e.wander_left = random.randf_range(3,8)
-				var goal = p + Vector2.RIGHT.rotated(random.randf_range(-PI,PI)) * random.randf_range(35,150)
-				e.tx = clampf(goal.x,50,world.map.size.x - 50); e.ty = clampf(goal.y,50,world.map.size.y - 50)
-		var target = Vector2(e.tx, e.ty)
-		if e.wave:
-			target = Vector2(clampf(p.x, 270, 625), 260) if world.state.wall > 0 else Vector2(375, 380)
-		if e.alert > 0 and (not e.wave or p.distance_to(player_pos()) < 125): target = Vector2(e.tx,e.ty)
-		var direction = (target - p).normalized()
-		var speed = 92 if e.kind == "fast" else (35 if e.kind == "breaker" else 48)
-		if e.alert <= 0 and not e.wave: speed *= 0.3
+		if Vector2(e.x,e.y).distance_squared_to(player) > 1250 * 1250: continue
+		e["ai_clock"]=e.get("ai_clock",0.0)+delta
+		active.append(e)
+	if active.is_empty(): enemy_update_cursor=0; return
+	var budget=maxi(1,ceili(active.size()/6.0))
+	var start=enemy_update_cursor%active.size()
+	for offset in range(mini(budget,active.size())):
+		var e: Dictionary=active[(start+offset)%active.size()]
+		if e.ai_clock<0.08: continue
+		var enemy_delta=minf(e.ai_clock,0.25)
+		e.ai_clock=0.0
+		var p=Vector2(e.x,e.y)
+		e.cd-=enemy_delta; e.alert=maxf(0,e.alert-enemy_delta)
+		if not e.has("mode"): e["mode"]="wander"
+		var sight=(140.0 if is_night() else 240.0)*Survival.visibility_factor(world)
+		e["sense_left"]=e.get("sense_left",0.0)-enemy_delta
+		if e.sense_left<=0:
+			e.sense_left=0.3
+			if p.distance_to(player_pos())<sight and visible(p,player_pos()):
+				e.alert=7; e.tx=world.state.px; e.ty=world.state.py; e.mode="chase"
+			elif e.mode=="chase": e.mode="search"
+		if e.alert<=0:
+			e.mode="wander"
+			e["wander_left"]=e.get("wander_left",0.0)-enemy_delta
+			if e.wander_left<=0 or p.distance_to(Vector2(e.tx,e.ty))<9:
+				e.wander_left=random.randf_range(3,8)
+				var goal=p+Vector2.RIGHT.rotated(random.randf_range(-PI,PI))*random.randf_range(35,150)
+				e.tx=clampf(goal.x,50,world.map.size.x-50); e.ty=clampf(goal.y,50,world.map.size.y-50)
+		elif p.distance_to(Vector2(e.tx,e.ty))<12:
+			e.mode="search"
+			# Search locally around the last observed/heard point; never update from a hidden player.
+			if e.alert>3:
+				var search=p+Vector2.RIGHT.rotated(float(hash(e.id)%360))*38
+				if not blocked(search): e.tx=search.x; e.ty=search.y
+		var target=Vector2(e.tx,e.ty)
+		var direction=(target-p).normalized()
+		var speed=92.0 if e.kind=="fast" else (35.0 if e.kind=="breaker" else 48.0)
+		if e.mode=="wander": speed*=0.3
 		if e.get("slow_until",0)>world.state.minute: speed*=0.35
-		if e.zone == "camp":
-			for defense in world.defenses:
-				if defense.hp > 0 and defense.kind == "wire" and defense_rect(defense).grow(10).has_point(p): speed *= 0.35
-		var step = direction * speed * delta
-		var next = move_with_collision(p, step)
-		if next.distance_to(p) < 0.1 and p.distance_to(target) > 35:
-			var tangent = Vector2(-direction.y,direction.x) * speed * delta
-			next = move_with_collision(p,tangent)
-			if next.distance_to(p) < 0.1: next = move_with_collision(p,-tangent)
-		e["walking"] = next.distance_to(p)>0.05
+		var next=move_with_collision(p,direction*speed*enemy_delta)
+		if next.distance_to(p)<0.1 and p.distance_to(target)>35:
+			next=Navigation.next_step(self,p,target,speed,enemy_delta)
+		e["walking"]=next.distance_to(p)>0.05
 		if e.walking: e["facing_x"]=(next-p).normalized().x; e["facing_y"]=(next-p).normalized().y
-		e.x = next.x; e.y = next.y
-		if e.cd > 0: continue
-		if p.distance_to(player_pos()) < 26:
-			damage_player(13 if e.kind == "breaker" else 8); e.cd = 1.0
-		elif e.wave and world.state.zone == "camp" and world.state.wall > 0 and p.y > 222 and p.y < 280:
-			world.state.wall = maxf(0, world.state.wall - (15 if e.kind == "breaker" else 6)); e.cd = 1
-		elif e.wave and world.state.zone == "camp" and world.state.wall <= 0 and p.distance_to(Vector2(375,380)) < 125:
-			world.state.core -= 7; e.cd = 1
-		else:
-			for defense in world.defenses:
-				if e.zone == "camp" and defense.hp > 0 and p.distance_to(Vector2(defense.x,defense.y)) < 55:
-					defense.hp = maxf(0,defense.hp - (15 if e.kind == "breaker" else 7)); e.cd = 1
+		e.x=next.x; e.y=next.y
+		if e.cd>0: continue
+		if next.distance_to(player_pos())<26 and visible(next,player_pos()):
+			damage_player(13 if e.kind=="breaker" else 8); e.cd=1.0
+		elif e.alert>0:
 			for f in world.furniture:
-				if f.zone == e.zone and not f.packed and f.hp > 0 and p.distance_to(Vector2(f.x,f.y)) < 38:
-					f.hp -= 9; e.cd = 1
+				if f.zone==e.zone and not f.packed and f.hp>0 and p.distance_to(Vector2(f.x,f.y))<38:
+					f.hp=maxf(0,f.hp-9); e.cd=1
 			for b in world.map.buildings_at(p,100):
-				for side in [0]:
-					if e.alert > 0 and Tactics.door_blocked(world,b) and p.distance_to(door_rect(b,side).get_center()) < 40:
-						if Tactics.damage_door(world,b.container+str(side),35 if e.kind=="breaker" else 14): world.note("门被撞坏了！")
-						e.cd = 2
-			if e.cd<=0 and e.alert>0 and world.state.zone=="town":
+				if Tactics.door_blocked(world,b) and p.distance_to(door_rect(b,0).get_center())<40:
+					if Tactics.damage_door(world,b.container+"0",35 if e.kind=="breaker" else 14): world.note("门被撞坏了！")
+					wake_for_barrier(b.container)
+					e.cd=2
+			if e.cd<=0:
 				for win in Tactics.windows(world,p,100):
 					if p.distance_to(win.pos)>40: continue
 					if win.state.board_hp>0 or not win.state.broken:
 						Tactics.damage_window(world,win.id,30 if e.kind=="breaker" else 12); e.cd=2
+						wake_for_barrier(str(win.id).trim_suffix("_window"))
 					elif (p.y-win.pos.y)*(e.ty-win.pos.y)<0:
 						var landing:Vector2=win.inside if e.ty<win.pos.y else win.outside
 						var approach:Vector2=win.outside if e.ty<win.pos.y else win.inside
 						if p.distance_to(approach)<=26 and not blocked(landing): e.x=landing.x; e.y=landing.y; e.cd=1
-	world.enemies = world.enemies.filter(func(e): return e.hp > 0)
+	enemy_update_cursor=(start+mini(budget,active.size()))%active.size()
+	world.enemies=world.enemies.filter(func(e):return e.hp>0)
+
+func wake_for_barrier(building_id: String):
+	if not world.state.systems_v5.sleeping: return
+	var bed=world.near_bed()
+	if bed.get("building_id","")!=building_id: return
+	world.state.systems_v5.sleeping=false; world.state.systems_v5.resting=false
+	world.note("撞击门窗的声音惊醒了你。")
 
 func damage_player(amount: float):
 	if last_damage > 0: return
@@ -364,6 +450,12 @@ func update_npcs(delta: float):
 	for n in world.npcs:
 		if n.zone != world.state.zone or n.status in ["down","waiting"]: continue
 		var p = Vector2(n.x,n.y)
+		if n.status=="injured" and not world.enemies.any(func(e):return e.hp>0 and Vector2(e.x,e.y).distance_to(p)<140):
+			for bed in world.beds():
+				if bed.hp>0 and p.distance_to(Vector2(bed.x,bed.y))<75:
+					n.hp=minf(90,n.hp+delta*0.35)
+					if n.hp>=85: n.status="healthy"
+					break
 		n["walking"]=false
 		var destination=p
 		if n.follow and p.distance_to(player_pos())>60: destination=player_pos()
@@ -384,32 +476,27 @@ func update_npcs(delta: float):
 		guard_cd = 1.1
 		for n in world.npcs:
 			if n.zone != world.state.zone or n.status in ["down","waiting"] or n.job != "守卫" or n.get("hold_fire",false): continue
-			if world.state.guard_ammo <= 0: continue
+			var guns=world.owned(n.id).filter(func(item):return item.has("slots"))
+			if guns.is_empty(): continue
+			var gun: Dictionary=guns[0]
+			if gun.ammo<=0:
+				var ammo_type: String=R.ITEMS[gun.def].ammo
+				var amount=mini(R.capacity_for(gun),world.count_item(ammo_type,n.id))
+				if amount<=0: continue
+				world.consume(ammo_type,amount,n.id); gun.ammo+=amount
 			for e in world.enemies:
 				if e.zone == n.zone and Vector2(e.x,e.y).distance_to(Vector2(n.x,n.y)) < 340:
 					if not visible(Vector2(n.x,n.y),Vector2(e.x,e.y),true): continue
-					e.hp -= 32; world.state.guard_ammo -= 1; n.xp += 1
+					e.hp -= R.weapon_stats(gun,world.items).damage; gun.ammo-=1; n.xp += 1
+					emit_noise(Vector2(n.x,n.y),280,false)
 					view.flashes.append({"a":Vector2(n.x,n.y),"b":Vector2(e.x,e.y),"life":0.1})
 					break
-	if world.state.zone == "camp" and world.npcs.any(func(n): return n.zone == "camp" and n.job == "守卫" and n.status not in ["down","waiting"] and not n.get("hold_fire",false)):
-		for defense in world.defenses:
-			if defense.kind != "guardpost" or defense.hp <= 0: continue
-			defense.cd -= delta
-			if defense.cd > 0 or world.state.guard_ammo <= 0: continue
-			for e in world.enemies:
-				if e.zone == "camp" and Vector2(e.x,e.y).distance_to(Vector2(defense.x,defense.y)) < 380:
-					if not visible(Vector2(defense.x,defense.y),Vector2(e.x,e.y),true): continue
-					e.hp -= 30; world.state.guard_ammo -= 1; defense.cd = 1.8
-					view.flashes.append({"a":Vector2(defense.x,defense.y),"b":Vector2(e.x,e.y),"life":0.1}); break
 
 func is_night() -> bool:
 	var minute = fmod(world.state.minute,1440)
 	return minute >= 1200 or minute < 360
 
 func container_pos(id: String) -> Vector2:
-	match id:
-		"warehouse": return Vector2(573,435)
-		"armory": return Vector2(620,380)
 	for g in world.graves:
 		if g.id == id: return Vector2(g.x,g.y)
 	for f in world.furniture:
@@ -422,17 +509,13 @@ func container_pos(id: String) -> Vector2:
 
 func targets() -> Array:
 	var list: Array = []
-	if world.state.zone == "camp":
-		list.append({"kind":"container","id":"warehouse","pos":container_pos("warehouse"),"name":"仓库"})
-		list.append({"kind":"container","id":"armory","pos":container_pos("armory"),"name":"军械补给箱"})
-		list.append({"kind":"repair","id":"wall","pos":Vector2(470,290),"name":"修理北墙 · 木材×2"})
-	else:
-		for b in world.map.buildings_at(player_pos(),200):
-			list.append({"kind":"container","id":b.container,"pos":container_pos(b.container),"name":"搜刮" + b.name})
-			for side in [0]: list.append({"kind":"door","id":b.container + str(side),"pos":door_rect(b,side).get_center(),"name":"加固房门" if Tactics.door_state(world,b.container+str(side)).board_hp>0 else "开关门"})
-	if world.state.zone=="camp":
-		list.append({"kind":"mechanics","id":"trader","pos":Vector2(740,420),"name":"中立商人 · 交换物资"})
-		list.append({"kind":"mechanics","id":"generator","pos":Vector2(430,440),"name":"发电机与休息"})
+	for b in world.map.buildings_at(player_pos(),200):
+		list.append({"kind":"container","id":b.container,"pos":container_pos(b.container),"name":"搜刮"+b.name})
+		list.append({"kind":"door","id":b.container+"0","pos":door_rect(b,0).get_center(),"name":"加固房门" if Tactics.door_state(world,b.container+"0").board_hp>0 else "开关门"})
+	for bed in world.beds():
+		list.append({"kind":"mechanics","id":bed.id,"pos":Vector2(bed.x,bed.y),"name":"床位 · 休息与落脚点"})
+	for exit in world.exits():
+		list.append({"kind":"mechanics","id":exit.id,"pos":Vector2(exit.x,exit.y),"name":exit.name})
 	for event in Survival.event_markers(world):
 		if event.zone==world.state.zone: list.append({"kind":"mechanics","id":event.id,"pos":Vector2(event.x,event.y),"name":"补给空投" if event.type=="supply" else "求救幸存者"})
 	if world.state.zone=="town":
@@ -465,14 +548,16 @@ func interact():
 		else: world.note("红色区域无法放置，请留出通路。")
 		return
 	var t = nearest_target()
-	if t.is_empty(): world.note("靠近门、物资箱、仓库或待救同伴后互动。"); return
+	if t.is_empty(): world.note("靠近房门、床位、物资、地区出口或待救同伴后互动。"); return
 	match t.kind:
 		"harvest": start_action({"kind":"harvest","id":t.id,"pos":t.pos},Forage.definition(t.plant_kind).duration)
 		"container", "furniture":
 			if not world.state.searched.has(t.id): start_action({"kind":"search","id":t.id,"pos":t.pos},2.6)
 			else: hud.container_id = t.id; hud.open_panel("loot")
 		"door":
-			if not Tactics.complete(self,{"kind":"tac_door_toggle","id":t.id}): world.note("门已加固或损坏，请打开生存操作处理。")
+			var d=Tactics.door_state(world,t.id)
+			if d.board_hp>0 or d.broken: world.note("门已加固或损坏，请打开生存操作处理。")
+			else: start_action({"kind":"tac_door_toggle","id":t.id},0.6)
 		"mechanics": hud.open_panel("mechanics")
 		"rescue": start_action({"kind":"rescue","id":t.id,"pos":t.pos},4)
 		"repair": start_action({"kind":"repair","id":"wall","pos":t.pos},3)
@@ -481,16 +566,18 @@ func start_action(request: Dictionary, duration: float = R.ACTION_SECONDS):
 	hud.close_panel()
 	action = request.duplicate(true); action["remaining"] = duration; action["duration"] = duration
 	action["zone"] = world.state.zone
+	action["map_id"] = world.state.get("map_id","town")
 
 func complete_action():
 	var request = action.duplicate(true); action.clear()
-	if request.zone != world.state.zone: return
+	if request.zone != world.state.zone or request.get("map_id",world.state.get("map_id","town"))!=world.state.get("map_id","town"): return
 	if request.has("pos") and (player_pos().distance_to(request.pos) > 85 or not interaction_visible(request.pos)):
 		world.note("行动中断：目标不可达。"); return
 	var ok = false
 	match request.kind:
 		"harvest": ok = world.harvest_plant(request.id)
 		"search":
+			emit_noise(player_pos(),110,false)
 			world.state.searched[request.id] = true; ok = true
 			hud.container_id = request.id; hud.open_panel("loot")
 		"build_defense":
@@ -508,9 +595,6 @@ func complete_action():
 				if ok:
 					for f in world.furniture:
 						if f.id == request.id: f.rotation = request.get("rotation",0)
-		"repair":
-			var owner = "player" if world.count_item("wood") >= 2 else "warehouse"
-			if world.state.zone == "camp" and world.consume("wood",2,owner): world.state.wall = minf(240,world.state.wall + 85); ok = true
 		"rescue":
 			for n in world.npcs:
 				if n.id == request.id and n.status in ["down","waiting"]:
@@ -518,12 +602,13 @@ func complete_action():
 						for other in world.npcs:
 							if other.id != n.id and other.follow:
 								other.follow = false
-								if other.zone != "camp" and other.status != "down": other["retreat_until"] = world.state.minute + 45
-						n.status = "injured"; n.hp = 35; n.follow = true; ok = true; world.note(n.name + "加入队伍，请护送回营休养。")
+						n.status = "injured"; n.hp = 35; n.follow = true; ok = true; world.note(n.name + "加入队伍，可在安全床位休养。")
 		_:
-			if str(request.kind).begins_with("sys_"): ok=Survival.complete(world,request)
+			if str(request.kind).begins_with("ex_"): ok=complete_exploration_action(request)
+			elif str(request.kind).begins_with("sys_"): ok=Survival.complete(world,request)
 			elif str(request.kind).begins_with("tac_"): ok=Tactics.complete(self,request)
 	if ok:
+		if request.kind in ["sys_cycle_boil","sys_cycle_wood","sys_cycle_craft"]: emit_noise(player_pos(),100,false)
 		sound.play("reload")
 		world.save_game()
 		if request.has("queue") and not request.queue.is_empty():
@@ -549,14 +634,13 @@ func defense_rect(defense: Dictionary) -> Rect2:
 	return Rect2(Vector2(defense.x,defense.y)-size/2,size)
 
 func start_defense(kind: String):
-	if world.state.zone != "camp": world.note("需要在营地内建造城防。"); return
 	var pos = (player_pos()+aim*70).snapped(Vector2(16,16))
-	if not valid_placement(pos): world.note("此处占用或堵住核心出口，请移开后建造。"); return
+	if not valid_placement(pos): world.note("此处占用，请留出通行空间。"); return
 	start_action({"kind":"build_defense","defense_kind":kind,"pos":pos},4)
 
 func start_new_game():
 	world.save_game(world.save_directory.path_join("previous-world.json"))
-	action.clear(); placement.clear(); solid_cache.clear(); polygon_cache.clear()
+	action.clear(); placement.clear(); recoil_heat.clear(); solid_cache.clear(); polygon_cache.clear()
 	world.new_world(); world.save_game(); world.save_game(world.dawn_path()); hud.close_panel()
 	ensure_spawn_point()
 
@@ -572,7 +656,7 @@ func placement_position() -> Vector2:
 	return (player_pos() + aim * 53).snapped(Vector2(16,16))
 
 func valid_placement(p: Vector2) -> bool:
-	if world.state.zone == "camp" and p.distance_to(Vector2(375,378)) < 70: return false
+	if p.distance_to(player_pos())<28: return false
 	for offset in [Vector2(-16,-16),Vector2(16,16),Vector2(-16,16),Vector2(16,-16)]:
 		if blocked(p + offset): return false
 	return true
@@ -594,7 +678,7 @@ func _unhandled_key_input(event):
 
 
 func mechanic_actions() -> Array:
-	return Survival.actions(world)+Tactics.actions(self)
+	return exploration_actions()+Survival.actions(world)+Tactics.actions(self)
 
 func mechanic_summary() -> String:
 	var result=Survival.summary(world)
@@ -603,14 +687,32 @@ func mechanic_summary() -> String:
 	return result
 
 func request_mechanic(request: Dictionary, duration: float = 1.0):
-	if world.state.failed: return
 	if request.get("kind","")=="npc_order":
 		request={"kind":"tac_order","id":request.get("npc",""),"order":request.get("order","follow")}
 	if duration<=0:
-		var ok=Survival.complete(world,request) if str(request.kind).begins_with("sys_") else Tactics.complete(self,request)
+		var ok=complete_exploration_action(request) if str(request.kind).begins_with("ex_") else (Survival.complete(world,request) if str(request.kind).begins_with("sys_") else Tactics.complete(self,request))
 		if ok: world.save_game()
 		else: world.note("操作未完成：请靠近目标并检查材料。")
 		hud.open_panel("mechanics"); return
 	start_action(request,duration)
 
 
+
+func exploration_actions() -> Array:
+	var out: Array=[]
+	for exit in world.exits():
+		if player_pos().distance_to(Vector2(exit.x,exit.y))<=100:
+			out.append({"label":exit.name+"（步行15分钟）","request":{"kind":"ex_travel","target_id":exit.target_id},"duration":2.0})
+	var bed=world.near_bed()
+	if not bed.is_empty():
+		out.append({"label":"登记此床位为落脚点","request":{"kind":"ex_register","bed_id":bed.id},"duration":1.0})
+	for furniture in world.furniture:
+		if not furniture.packed and furniture.hp>0 and player_pos().distance_to(Vector2(furniture.x,furniture.y))<=65:
+			out.append({"label":"打包空柜子（保留同一实例）","request":{"kind":"pack","id":furniture.id,"pos":Vector2(furniture.x,furniture.y)},"duration":2.0})
+	return out
+
+func complete_exploration_action(request: Dictionary) -> bool:
+	match request.get("kind",""):
+		"ex_travel": return travel_request(request.get("target_id",""))
+		"ex_register": return world.register_shelter(request.get("bed_id",""))
+	return false

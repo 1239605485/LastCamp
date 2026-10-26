@@ -22,5 +22,6 @@ func run():
 		var elapsed = float(Time.get_ticks_usec() - start) / 1000000.0
 		results.append({"enemies":count,"average_fps":snappedf(frames / elapsed,0.1),"worst_frame_ms":snappedf(worst,0.1),"renderer":RenderingServer.get_video_adapter_name(),"platform":"Windows desktop; NOT Android"})
 		print(results.back())
-	var file = FileAccess.open("res://builds/desktop-benchmark.json",FileAccess.WRITE); file.store_string(JSON.stringify(results,"  ")); file.close()
+	var file = FileAccess.open("user://desktop-benchmark.json",FileAccess.WRITE); file.store_string(JSON.stringify(results,"  ")); file.close()
 	game.queue_free(); await create_timer(0.3).timeout; quit()
+

@@ -99,7 +99,9 @@ func _shore_x(y: float) -> float:
 func _generate_v4():
 	var rng = RandomNumberGenerator.new()
 	rng.seed = seed
-	settlements = [Vector2(610,490)]
+	settlements = [Vector2(610,650)]
+	# A connected north/south street makes the opening town a navigable junction.
+	roads.append({"a":Vector2(1140,200),"b":Vector2(1140,1600)})
 	# Jittered, widely spaced towns leave broad stretches of unbuilt countryside.
 	for row in range(2):
 		for col in range(3):
@@ -120,7 +122,7 @@ func _generate_v4():
 	buildings = [
 		{"name":"榆树街民居","rect":Rect2(210,170,290,250),"container":"house","kind":"house","art":"b_city_house_1"},
 		{"name":"社区诊所","rect":Rect2(720,150,290,250),"container":"clinic","kind":"clinic","art":"b_hospital"},
-		{"name":"警务站","rect":Rect2(480,610,330,260),"container":"police","kind":"police","art":"b_police_station"}]
+		{"name":"警务站","rect":Rect2(480,800,330,260),"container":"police","kind":"police","art":"b_police_station"}]
 	for i in range(settlements.size()):
 		var c: Vector2 = settlements[i]
 		sectors.append({"id":"region_%d" % i,"name":names[i],"kind":"city" if i == 0 else "village","center":c,"rect":Rect2(c-Vector2(1150,1050),Vector2(2300,2100))})
@@ -202,7 +204,7 @@ func container_pos(id: String) -> Vector2:
 		if b.container == id:
 			if id == "house": return Vector2(265,350)
 			if id == "clinic": return Vector2(945,330)
-			if id == "police": return Vector2(740,780)
+			if id == "police": return Vector2(740,970)
 			return b.rect.end - Vector2(58,55)
 	return Vector2(-999,-999)
 
@@ -216,6 +218,7 @@ func _prop_clear(p: Vector2,padding: float,zone: String) -> bool:
 	return true
 
 func _generate_cars():
+	_cars.append(_car("car_starter_wreck",Vector2(1128,650),1,"town"))
 	_cars.append(_car("car_camp_0",Vector2(900,600),0,"camp"))
 	var rng = RandomNumberGenerator.new()
 	rng.seed = seed + 9791

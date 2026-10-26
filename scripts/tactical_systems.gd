@@ -91,7 +91,9 @@ static func damage_window(w, id: String, damage: float) -> bool:
 	var win: Dictionary = w.state.tactics_v5.windows[id]
 	var absorbed = minf(win.board_hp,maxf(0,damage)); win.board_hp -= absorbed; damage -= absorbed
 	if damage > 0: win.hp = maxf(0,win.hp - damage)
-	if win.hp <= 0: win.broken = true
+	if win.hp <= 0:
+		if not win.broken: win["glass_cleared"] = false
+		win.broken = true
 	return win.broken and win.board_hp <= 0
 # Front facade window: both landing points must lie on native walkable floor.
 static func windows(w, center: Vector2, radius: float = 180) -> Array:
@@ -123,6 +125,14 @@ static func solids(game) -> Array:
 static func add_action(out: Array, label: String, request: Dictionary, duration: float):
 	out.append({"label":label,"request":request,"duration":duration})
 
+static func opening_threat(w,p: Vector2) -> bool:
+	return w.enemies.any(func(e):return e.zone==w.state.zone and e.hp>0 and Vector2(e.x,e.y).distance_to(p)<80)
+
+static func boarding_action(out: Array,w,p: Vector2,label: String,request: Dictionary):
+	if opening_threat(w,p):
+		out.append({"label":"敌人贴近，暂时无法加固","request":request,"duration":2.4,"enabled":false})
+	else: add_action(out,label,request,2.4)
+
 static func actions(game) -> Array:
 	var w = game.world; ensure(w); var out: Array = []; var p: Vector2 = game.player_pos()
 	if w.state.zone == "town":
@@ -131,7 +141,7 @@ static func actions(game) -> Array:
 			var id: String = b.container + "0"; var d = door_state(w,id)
 			if d.board_hp <= 0:
 				if not d.broken: add_action(out,"开关房门",{"kind":"tac_door_toggle","id":id},0.6)
-				add_action(out,"木板封门（木材2）",{"kind":"tac_door_board","id":id},2.4)
+				boarding_action(out,w,G.door(b).get_center(),"木板封门（木材2）",{"kind":"tac_door_board","id":id})
 			else: add_action(out,"拆除门上木板",{"kind":"tac_door_unboard","id":id},2.0)
 			if not d.broken or d.board_hp > 0: add_action(out,"破坏房门",{"kind":"tac_door_break","id":id},1.4)
 		for win in windows(w,p):
@@ -140,9 +150,11 @@ static func actions(game) -> Array:
 				add_action(out,"拆除窗上木板",{"kind":"tac_window_unboard","id":win.id},2.0)
 				add_action(out,"破坏封窗",{"kind":"tac_window_break","id":win.id},1.4)
 			else:
-				add_action(out,"木板封窗（木材2）",{"kind":"tac_window_board","id":win.id},2.4)
+				boarding_action(out,w,win.pos,"木板封窗（木材2）",{"kind":"tac_window_board","id":win.id})
 				if not win.state.broken: add_action(out,"打破玻璃窗",{"kind":"tac_window_break","id":win.id},1.0)
-				else: add_action(out,"翻越窗户",{"kind":"tac_window_climb","id":win.id},1.5)
+				else:
+					if not win.state.get("glass_cleared",false): add_action(out,"清理残留玻璃",{"kind":"tac_window_clear","id":win.id},1.8)
+					add_action(out,"翻越窗户" if win.state.get("glass_cleared",false) else "翻越碎窗（可能割伤）",{"kind":"tac_window_climb","id":win.id},1.5)
 	for f in w.furniture:
 		if f.zone == w.state.zone and not f.packed and f.hp > 0 and p.distance_to(Vector2(f.x,f.y)) < 65:
 			add_action(out,"推柜子",{"kind":"tac_push","id":f.id},1.2)
@@ -160,11 +172,9 @@ static func actions(game) -> Array:
 static func spend(w, cost: Dictionary) -> bool:
 	for material in cost:
 		var available: int = w.count_item(material)
-		if w.state.zone == "camp": available += w.count_item(material,"warehouse")
 		if available < cost[material]: return false
 	for material in cost:
-		var take = mini(w.count_item(material),cost[material]); w.consume(material,take)
-		if cost[material] > take: w.consume(material,cost[material]-take,"warehouse")
+		w.consume(material,cost[material])
 	return true
 
 static func complete(game, request: Dictionary) -> bool:
@@ -172,6 +182,7 @@ static func complete(game, request: Dictionary) -> bool:
 	# Revalidate context after the timed interaction, including range and current state.
 	var allowed = false
 	for a in actions(game):
+		if not a.get("enabled",true): continue
 		var matches = true
 		for key in a.request:
 			if request.get(key) != a.request[key]: matches = false; break
@@ -185,7 +196,9 @@ static func complete(game, request: Dictionary) -> bool:
 				if not spend(w,{"wood":2}): return false
 				d.board_hp = 120.0; w.doors[id] = false
 			"tac_door_unboard": d.board_hp = 0.0
-			"tac_door_break": damage_door(w,id,45); w.state.stamina = maxf(0,w.state.stamina-7)
+			"tac_door_break":
+				damage_door(w,id,45); w.state.stamina = maxf(0,w.state.stamina-7)
+				game.emit_noise(p,320)
 	elif kind.begins_with("tac_window_"):
 		for win in windows(w,p):
 			if win.id != id: continue
@@ -195,12 +208,14 @@ static func complete(game, request: Dictionary) -> bool:
 					win.state.board_hp = 100.0
 				"tac_window_unboard": win.state.board_hp = 0.0
 				"tac_window_break": damage_window(w,id,40); noise(w,win.pos,w.state.zone)
+				"tac_window_clear": win.state["glass_cleared"] = true
 				"tac_window_climb":
 					var approach:Vector2=win.outside if p.y>=win.pos.y else win.inside
 					if p.distance_to(approach)>26: return false
 					var target: Vector2 = win.inside if p.y >= win.pos.y else win.outside
 					if game.blocked(target) or p.distance_to(target) > 78 or w.state.stamina < 6: return false
 					game.set_pos(target); w.state.stamina -= 6
+					if not win.state.get("glass_cleared",false): w.state.hp=maxf(0,w.state.hp-5); w.state.bleeding=true
 			return true
 	elif kind in ["tac_push","tac_pull"]: return move_furniture(game,id,kind == "tac_pull")
 	elif kind == "tac_order":
@@ -253,10 +268,10 @@ static func move_furniture(game, id: String, pull: bool) -> bool:
 		return true
 	return false
 
-static func noise(w, p: Vector2, zone: String):
+static func noise(w, p: Vector2, zone: String, radius: float = 360):
 	for e in w.enemies:
-		if e.zone == zone and e.hp > 0 and Vector2(e.x,e.y).distance_to(p) < 360:
-			e.alert = maxf(e.get("alert",0),12); e["tx"] = p.x; e["ty"] = p.y
+		if e.zone == zone and e.hp > 0 and Vector2(e.x,e.y).distance_to(p) < radius:
+			e.alert = maxf(e.get("alert",0),12); e["tx"] = p.x; e["ty"] = p.y; e["mode"]="investigate"
 	w.note("响声惊动了附近的感染者。")
 
 static func trigger_contacts(w, zone: String):
@@ -276,8 +291,8 @@ static func tick(game, _delta: float) -> bool:
 	return game.world.state.tactics_v5.traps.filter(func(t):return t.kind=="alarm" and t.armed).size()<before
 
 static func advance_offscreen(w, _minutes: float):
-	# Only evaluate the inactive zone; active contacts are handled by tick().
-	trigger_contacts(w,"town" if w.state.zone == "camp" else "camp")
+	# Inactive regions are snapshots, not a second simulation of active traps.
+	pass
 
 
 

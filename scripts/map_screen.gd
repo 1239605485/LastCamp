@@ -45,7 +45,23 @@ func _draw():
 		draw_rect(Rect2(to_view(b.rect.position),b.rect.size * s).grow(1),color)
 	var player = to_view(game.player_pos()) if game.world.state.zone == "town" else to_view(Vector2(45,490))
 	draw_circle(player,5,Color("e5c465")); draw_arc(player,9,0,TAU,20,Color("e5c465"),1)
-	var camp = to_view(Vector2(30,490)); draw_rect(Rect2(camp - Vector2(5,5),Vector2(10,10)),Color("8adca4"))
+	# Undiscovered sectors do not reveal roads, buildings or enemy positions.
+	for y in range(0,int(map.size.y),256):
+		for x in range(0,int(map.size.x),256):
+			var pos=Vector2(x,y)
+			if map.sector_id(pos) not in game.world.state.explored:
+				draw_rect(Rect2(to_view(pos),Vector2(257,257)*s),Color("20212b"))
+	draw_circle(player,5,Color("e5c465"))
+	for exit in game.world.exits():
+		if map.sector_id(Vector2(exit.x,exit.y)) not in game.world.state.explored: continue
+		var p=to_view(Vector2(exit.x,exit.y))
+		draw_rect(Rect2(p-Vector2(5,5),Vector2(10,10)),Color("86c4d2"))
+		draw_string(font,p+Vector2(9,3),exit.name,HORIZONTAL_ALIGNMENT_LEFT,-1,12,Color("b7e3e8"))
+	for shelter in game.world.state.get("shelters",[]):
+		if shelter.get("map_id","")!=game.world.state.get("map_id","town"): continue
+		var p=to_view(Vector2(shelter.x,shelter.y))
+		draw_rect(Rect2(p-Vector2(4,4),Vector2(8,8)),Color("8adca4"))
+		draw_string(font,p+Vector2(8,3),str(shelter.get("name","住所")),HORIZONTAL_ALIGNMENT_LEFT,-1,12,Color("b4d6a7"))
 	for grave in game.world.graves:
 		if grave.zone == "town": draw_circle(to_view(Vector2(grave.x,grave.y)),4,Color("d18c66"))
 	for npc in game.world.npcs:
